@@ -1,0 +1,13 @@
+{
+  // Type-checking only: Node runs the .ts file directly (type stripping), so nothing is emitted.
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "nodenext",
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"]
+  },
+  "include": ["src", "../mock-unified"]
+}
