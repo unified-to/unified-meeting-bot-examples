@@ -12,4 +12,4 @@ To build a binary instead, run `go build -o meeting-bot .`.
 
 **Signature note:** keep `data` as a `json.RawMessage` and sign those bytes. Re-encoding the parsed events with `json.Marshal` escapes `&`, `<` and `>`, so the signature fails whenever a transcript contains one of them.
 
-See the [main README](../README.md) for setup, the event reference and production notes.
+First time? Follow the [setup guide](../SETUP.md). The [main README](../README.md) has the event reference and production notes.

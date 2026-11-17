@@ -12,4 +12,4 @@ python3 meeting_bot.py --name "Notetaker" <meeting_url>
 
 **Signature note:** Unified signs `JSON.stringify(data)`. `json.dumps(data, separators=(",", ":"), ensure_ascii=False)` produces the same compact JSON. The default `json.dumps` adds spaces and escapes non-ASCII characters, which breaks the signature.
 
-See the [main README](../README.md) for setup, the event reference and production notes.
+First time? Follow the [setup guide](../SETUP.md). The [main README](../README.md) has the event reference and production notes.

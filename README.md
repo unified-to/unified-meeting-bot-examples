@@ -4,6 +4,8 @@ These are small command-line meeting bots built on [Unified](https://unified.to)
 
 All three programs follow the same steps in the same order and print the same output, so you can read the language you know and compare it with the others.
 
+**New here? Start with the [setup guide](SETUP.md).** It walks you through creating your meeting platform app, connecting an account and running your first bot.
+
 ```
 $ node src/meeting-bot.ts https://us02web.zoom.us/j/81234567890
 Listening for webhooks on http://localhost:3000/bot-events
@@ -44,13 +46,19 @@ Unified only delivers bot events as webhooks, so each example runs a small web s
 
 6. **On `RECORDING_READY`,** read the bot again (`getCalendarBot`) to get its `recording_id`, then fetch the recording (`getCalendarRecording`, `GET /calendar/{connection_id}/recording/{id}`). Print its link and, for each `media` item, its `transcripts` (speaker and text) or the `transcript_download_url`. This runs after the webhook reply, because it calls the API.
 
-## Before you start
+## Setup
 
-1. **Set up a meeting-bot integration in Unified.** There are four: `zoommeetingbot`, `microsoftteamsmeetingbot`, `webexmeetingbot` and `googlemeetmeetingbot`. They're separate from the regular Zoom, Teams, Webex and Meet integrations, and each one needs its own app on the meeting platform. Follow the setup guide for yours: [Zoom](https://docs.unified.to/guides/how_to_set_up_a_zoom_meeting_bot_with_unified), [Microsoft Teams](https://docs.unified.to/guides/how_to_set_up_a_microsoft_teams_meeting_bot_with_unified), [Webex](https://docs.unified.to/guides/how_to_set_up_a_webex_meeting_bot_with_unified) or [Google Meet](https://docs.unified.to/guides/how_to_set_up_a_google_meet_meeting_bot_with_unified).
-2. **Authorize a connection** with the `calendar_bot_read`, `calendar_bot_write` and `calendar_botevent_read` permissions, plus `calendar_recording_read` for lesson 2. Copy its connection ID.
-3. **Copy your API key and workspace secret** from **Settings → API Keys** in the Unified app.
-4. **Start a tunnel** to port 3000, for example `ngrok http 3000` or `cloudflared tunnel --url http://localhost:3000`, and copy its HTTPS URL.
-5. **Configure.** Run `cp .env.example .env`, fill in the values, then load them into your shell with `set -a; source .env; set +a`.
+The full walkthrough is in **[SETUP.md](SETUP.md)**. In short:
+
+1. **Copy your API key, workspace secret and workspace ID** from **Settings → API Keys** in the [Unified app](https://app.unified.to).
+2. **Create an app on your meeting platform and activate its meeting-bot integration in Unified.** Each platform has its own integration (`zoommeetingbot`, `microsoftteamsmeetingbot`, `webexmeetingbot`, `googlemeetmeetingbot`) and needs your own app credentials. Follow the guide for yours:
+   - [How to set up a Zoom meeting bot](https://docs.unified.to/guides/how_to_set_up_a_zoom_meeting_bot_with_unified)
+   - [How to set up a Microsoft Teams meeting bot](https://docs.unified.to/guides/how_to_set_up_a_microsoft_teams_meeting_bot_with_unified)
+   - [How to set up a Webex meeting bot](https://docs.unified.to/guides/how_to_set_up_a_webex_meeting_bot_with_unified)
+   - [How to set up a Google Meet meeting bot](https://docs.unified.to/guides/how_to_set_up_a_google_meet_meeting_bot_with_unified)
+3. **Connect the account that hosts your meetings** with the `calendar_bot_read`, `calendar_bot_write`, `calendar_botevent_read` and `calendar_recording_read` permissions, and copy the connection ID. [SETUP.md](SETUP.md#3-connect-an-account) has a ready-made authorization link.
+4. **Start a tunnel** to port 3000, for example `ngrok http 3000` or `cloudflared tunnel --url http://localhost:3000`, and copy its HTTPS address.
+5. **Configure.** Run `cp .env.example .env`, fill in the values, then load them with `set -a; source .env; set +a`.
 
 ## Run
 
@@ -109,14 +117,25 @@ Bot statuses move differently on each platform:
 - **Verify every delivery.** `sig256` is `base64(HMAC-SHA256(workspace_secret, JSON.stringify(data) + nonce))`. The signature covers `data` exactly as it was sent, and each example shows how to get those bytes right in its language.
 - **Reply within 5 seconds.** Unified retries a delivery that fails, and it marks a webhook unhealthy if deliveries keep failing. Do slow work, like summaries or CRM updates, after replying. Make handlers idempotent: event ids can repeat, so don't deduplicate on `id` alone. The examples compare whole events.
 - **Zoom needs `recording_config`** to send live captions and chat, and RTMS has to start in the meeting, either through the host or an auto-start setting. The other platforms reject `recording_config` with `501`. The examples check for `zoom.us` in the meeting URL; in an app, check the connection's `integration_type` instead.
-- **Teams and Google Meet only follow meetings the connected user organizes.** On Teams, create the bot before the meeting ends.
-- **Keep listening after `CALL_ENDED`.** Teams, Webex and Meet send transcripts after the meeting, Webex and Meet bots never reach `DONE`, and Zoom sends a second `RECORDING_READY` once its transcript file is complete. Watch for `RECORDING_READY` rather than a final status.
+- **The connected user must host the meeting.** Teams needs a scheduled meeting the user organizes, Google Meet needs a meeting the user owns, and Webex needs the user to host it (or have the recording shared with them).
+- **Start before the meeting does.** Teams, Webex and Google Meet only send events to webhooks that existed when the meeting began.
+- **Keep listening after `CALL_ENDED`.** Teams, Webex and Meet send transcripts after the meeting: up to 4 hours later on Teams and up to 24 hours on Webex. Webex and Meet bots never reach `DONE`, and Zoom sends a second `RECORDING_READY` once its transcript file is complete. Watch for `RECORDING_READY` rather than a final status, and don't press Ctrl+C until it arrives: that removes the bot and webhook.
+- **Google Meet allows one `calendar_botevent` webhook per connection.** If the example gets a `409` when subscribing, delete the existing webhook under **Webhooks** in the Unified app, or use another connection.
 - **One active bot per meeting URL per connection.** Creating a second one returns `409`.
 - **Regions:** set `UNIFIED_API_URL` to `https://api-eu.unified.to` or `https://api-au.unified.to` for EU or AU workspaces.
 
 ## Learn more
 
-- [How to build a meeting bot with Unified](https://docs.unified.to/guides/how_to_build_a_meeting_bot_with_unified_zoom_microsoft_teams_webex_google_meet)
+Guides on docs.unified.to:
+
+- [How to build a meeting bot with Unified (Zoom, Microsoft Teams, Webex, Google Meet)](https://docs.unified.to/guides/how_to_build_a_meeting_bot_with_unified_zoom_microsoft_teams_webex_google_meet)
+- [How to set up a Zoom meeting bot with Unified](https://docs.unified.to/guides/how_to_set_up_a_zoom_meeting_bot_with_unified)
+- [How to set up a Microsoft Teams meeting bot with Unified](https://docs.unified.to/guides/how_to_set_up_a_microsoft_teams_meeting_bot_with_unified)
+- [How to set up a Webex meeting bot with Unified](https://docs.unified.to/guides/how_to_set_up_a_webex_meeting_bot_with_unified)
+- [How to set up a Google Meet meeting bot with Unified](https://docs.unified.to/guides/how_to_set_up_a_google_meet_meeting_bot_with_unified)
+
+API reference:
+
 - [Create a bot](https://docs.unified.to/calendar/bot/Create_a_bot), the [bot event model](https://docs.unified.to/calendar/botevent/model) and the [recording model](https://docs.unified.to/calendar/recording/model)
 - [Webhooks](https://docs.unified.to/reference/webhooks) and [SDKs](https://docs.unified.to/reference/sdks)
 

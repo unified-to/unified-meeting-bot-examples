@@ -13,4 +13,4 @@ To type-check the code (optional), run `npm run typecheck`.
 
 **Signature note:** `JSON.stringify(delivery.data)` reproduces exactly what Unified signed, because Unified signs with `JSON.stringify` too.
 
-See the [main README](../README.md) for setup, the event reference and production notes.
+First time? Follow the [setup guide](../SETUP.md). The [main README](../README.md) has the event reference and production notes.
