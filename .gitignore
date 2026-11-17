@@ -1,5 +1,5 @@
 .env
 node_modules/
 __pycache__/
-target/
+.venv/
 go/meeting-bot

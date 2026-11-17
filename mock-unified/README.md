@@ -2,9 +2,9 @@
 
 [`server.ts`](server.ts) is a local stand-in for the parts of the Unified API the examples use. Use it to try an example, or to teach with one, without a real meeting, accounts or a tunnel. It needs Node.js 22.18+ and has no dependencies.
 
-When an example creates a bot, the mock plays back a short scripted Zoom meeting as signed `calendar_botevent` webhooks. The script includes three deliveries the examples should not print:
+When an example creates a bot, the mock plays back a short scripted Zoom meeting as signed `calendar_botevent` webhooks. It ends with `RECORDING_READY` and then serves the recording and transcript, for lesson 2. The script includes three deliveries the examples should not print:
 
-- a **retried delivery** with the same event id, which should be printed once
+- a **retried delivery** of the same event, which should be printed once
 - an event for **another bot** on the same connection, which should be skipped
 - a **tampered delivery** whose signature doesn't match, which should be rejected with `401`
 

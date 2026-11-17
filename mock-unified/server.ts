@@ -7,8 +7,9 @@
  *   POST   /unified/webhook                    subscribe to bot events
  *   DELETE /unified/webhook/{id}               unsubscribe
  *   POST   /calendar/{connection_id}/bot       create a bot  → starts the replay
- *   GET    /calendar/{connection_id}/bot/{id}  read a bot
+ *   GET    /calendar/{connection_id}/bot/{id}  read a bot (recording_id appears at RECORDING_READY)
  *   DELETE /calendar/{connection_id}/bot/{id}  remove a bot  → stops the replay
+ *   GET    /calendar/{connection_id}/recording/{id}  read a recording and its transcript
  *   GET    /_mock/state                        counters used by scripts/test-all.sh
  *
  * The replay also sends a duplicate delivery, an event for another bot and a delivery
@@ -32,6 +33,7 @@ if (!SECRET) {
 type Json = Record<string, any>;
 const webhooks = new Map<string, Json>();
 const bots = new Map<string, Json>();
+const recordings = new Map<string, Json>();
 const state = { deliveries_ok: 0, deliveries_rejected: 0, deliveries_failed: 0 };
 
 const newId = () => randomBytes(12).toString("hex"); // looks like a Unified id
@@ -61,8 +63,9 @@ createServer(async (req, res) => {
   if (pathname === "/_mock/state") {
     return send(res, 200, { ...state, webhooks: webhooks.size, active_bots: bots.size });
   }
-  if (!req.headers.authorization?.startsWith("Bearer ")) {
-    return error(res, 401, "Missing bearer token");
+  // The SDKs send the API key as-is in the Authorization header; raw HTTP calls add "Bearer ".
+  if (!req.headers.authorization) {
+    return error(res, 401, "Missing Authorization header");
   }
 
   // POST /unified/webhook
@@ -109,23 +112,33 @@ createServer(async (req, res) => {
         ...(body.recording_config && { recording_config: body.recording_config }),
       };
       bots.set(bot.id, bot);
-      const { connection_id, ...publicBot } = bot;
-      send(res, 200, publicBot);
+      send(res, 200, withoutConnectionId(bot));
       replayMeeting(connectionId, bot.id);
       return;
     }
 
     const bot = botId && bots.get(botId);
     if (!bot) return error(res, 404, "Bot not found");
-    if (req.method === "GET") return send(res, 200, bot);
+    if (req.method === "GET") return send(res, 200, withoutConnectionId(bot));
     if (req.method === "DELETE") {
       bots.delete(botId);
       return send(res, 200, {});
     }
   }
 
+  // GET /calendar/{connection_id}/recording/{id}
+  if (req.method === "GET" && parts[0] === "calendar" && parts[2] === "recording" && parts[3]) {
+    const recording = recordings.get(parts[3]);
+    if (!recording) return error(res, 404, "Recording not found");
+    return send(res, 200, recording);
+  }
+
   error(res, 404, `No mock for ${req.method} ${pathname}`);
 }).listen(PORT, () => console.log(`Mock Unified API on http://localhost:${PORT}`));
+
+function withoutConnectionId({ connection_id, ...bot }: Json): Json {
+  return bot;
+}
 
 // --- The scripted meeting --------------------------------------------------------
 
@@ -149,8 +162,9 @@ async function replayMeeting(connectionId: string, botId: string): Promise<void>
       transcript: { text, participant: who, start_at: at(), end_at: at(), language: "en", is_final: true },
     });
 
-  const deliveries: { data: Json[]; tamper: boolean }[] = [];
-  const add = (data: Json[], tamper = false) => deliveries.push({ data, tamper });
+  const deliveries: { data: Json[]; tamper?: boolean; before?: () => void }[] = [];
+  const add = (data: Json[], options: { tamper?: boolean; before?: () => void } = {}) =>
+    deliveries.push({ data, ...options });
 
   add([status("IN_CALL_RECORDING")]);
   add([event("PARTICIPANT_JOINED", { participant: jane })]);
@@ -163,14 +177,15 @@ async function replayMeeting(connectionId: string, botId: string): Promise<void>
   add([{ ...said(jane, "This belongs to another bot."), bot_id: "some-other-bot" }]); // should be skipped
   const chat = { message: "Slides: https://example.com/deck?a=1&b=2", sender: sam, is_private: false };
   add([event("CHAT_MESSAGE_RECEIVED", { chat_message: chat })]);
-  add([said(jane, "This delivery was tampered with.")], true); // should be rejected with 401
+  add([said(jane, "This delivery was tampered with.")], { tamper: true }); // should be rejected with 401
   add([event("PARTICIPANT_LEFT", { participant: sam })]);
-  add([status("CALL_ENDED"), event("RECORDING_READY")]); // one delivery can carry several events
-  add([status("DONE")]);
+  add([status("CALL_ENDED"), status("DONE")]); // one delivery can carry several events
+  add([event("RECORDING_READY")], { before: () => saveRecording(botId, [jane, sam]) });
 
   for (const delivery of deliveries) {
     await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
     if (!bots.has(botId)) return; // bot was removed: stop sending
+    delivery.before?.();
     const bot = bots.get(botId)!;
     for (const e of delivery.data) {
       if (e.bot_id === botId && e.status_change) bot.status = e.status_change.status;
@@ -179,6 +194,37 @@ async function replayMeeting(connectionId: string, botId: string): Promise<void>
       if (webhook.connection_id === connectionId) await deliver(webhook, delivery.data, delivery.tamper);
     }
   }
+}
+
+/** Stores the meeting's recording and points the bot at it, as happens before RECORDING_READY. */
+function saveRecording(botId: string, [jane, sam]: Json[]): void {
+  const line = (who: Json, text: string, second: number) => ({
+    text,
+    attendee: { name: who.name, email: who.email },
+    start_at: `2026-11-16T15:00:${String(second).padStart(2, "0")}.000Z`,
+    end_at: `2026-11-16T15:00:${String(second + 2).padStart(2, "0")}.000Z`,
+    language: "en",
+  });
+  const recording = {
+    id: newId(),
+    created_at: "2026-11-16T15:00:23.000Z",
+    start_at: "2026-11-16T15:00:00.000Z",
+    end_at: "2026-11-16T15:00:20.000Z",
+    web_url: "https://zoom.us/rec/share/mock-recording",
+    media: [
+      {
+        recording_download_url: "https://zoom.us/rec/download/mock-recording.mp4",
+        transcript_download_url: "https://zoom.us/rec/download/mock-transcript.vtt",
+        transcripts: [
+          line(jane, "Welcome, everyone. Let's start with the roadmap.", 4),
+          line(sam, `Sounds good — Q&A at the end? <3 "café" ✓ 🎉`, 7),
+          line(jane, "Thanks, everyone.", 16),
+        ],
+      },
+    ],
+  };
+  recordings.set(recording.id, recording);
+  bots.get(botId)!.recording_id = recording.id;
 }
 
 /** POST one signed delivery, the way Unified does: sig256 = base64(HMAC-SHA256(secret, JSON.stringify(data) + nonce)) */

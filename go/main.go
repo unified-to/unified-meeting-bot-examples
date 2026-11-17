@@ -1,19 +1,20 @@
 // Command meeting-bot is the Go example of a Unified meeting bot.
 //
 // It sends a bot into a Zoom, Microsoft Teams, Webex or Google Meet meeting with
-// Unified's Calendar API (calendar_bot), then prints every calendar_botevent
-// webhook it receives.
+// Unified's Calendar API (calendar_bot), prints every calendar_botevent webhook it
+// receives, and fetches the recording and transcript when they're ready.
 //
-//	go run . [--name "Meeting Bot"] [--json] <meeting_url>
+//	go run . [--name "Meeting Bot"] <meeting_url>
 //
 // How it works:
 //  1. Start a local HTTP server to receive webhooks (PUBLIC_URL forwards to it).
 //  2. Subscribe to calendar_botevent webhooks for the connection.
 //  3. Create the bot for the meeting URL.
-//  4. Verify and print each event as it arrives.
+//  4. Verify and print each event as it arrives. On RECORDING_READY, fetch the
+//     recording and print its transcript.
 //  5. On Ctrl+C, remove the bot (it leaves the meeting) and the webhook.
 //
-// Standard library only: Go 1.22+.
+// Uses the official SDK (github.com/unified-to/unified-go-sdk), which needs Go 1.26.10+.
 package main
 
 import (
@@ -25,7 +26,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -33,12 +33,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	unified "github.com/unified-to/unified-go-sdk"
+	"github.com/unified-to/unified-go-sdk/pkg/models/operations"
+	"github.com/unified-to/unified-go-sdk/pkg/models/shared"
 )
 
 const webhookPath = "/bot-events"
 
-// --- Types: only the fields this example prints ------------------------------------
-// Full model: https://docs.unified.to/calendar/botevent/model
+// --- Webhook payload types ---------------------------------------------------------
+// Bot events arrive only as webhooks, so the SDK has no type for them. These are the
+// fields this example prints. Full model: https://docs.unified.to/calendar/botevent/model
 
 type Participant struct {
 	ID     string `json:"id"`
@@ -78,19 +83,18 @@ type delivery struct {
 
 // app holds the configuration and the state shared with the webhook handler.
 type app struct {
-	apiURL, apiKey, connectionID, workspaceSecret, publicURL, port string
-	printJSON                                                      bool
+	unified                                        *unified.UnifiedTo
+	connectionID, workspaceSecret, publicURL, port string
 
 	botID atomic.Value // string, set once our bot exists
-	seen  sync.Map     // Unified retries failed deliveries, so skip repeats
+	seen  sync.Map     // events already printed
 }
 
 func main() {
 	name := flag.String("name", "Meeting Bot", "bot name shown to people in the meeting")
-	printJSON := flag.Bool("json", false, "print each event as raw JSON")
 	flag.Parse()
 	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, `Usage: go run . [--name "Meeting Bot"] [--json] <meeting_url>`)
+		fmt.Fprintln(os.Stderr, `Usage: go run . [--name "Meeting Bot"] <meeting_url>`)
 		os.Exit(2)
 	}
 	meetingURL := flag.Arg(0)
@@ -108,13 +112,14 @@ func main() {
 	}
 
 	a := &app{
-		apiURL:          envOr("UNIFIED_API_URL", "https://api.unified.to"),
-		apiKey:          os.Getenv("UNIFIED_API_KEY"),
+		unified: unified.New(
+			unified.WithSecurity(os.Getenv("UNIFIED_API_KEY")),
+			unified.WithServerURL(envOr("UNIFIED_API_URL", "https://api.unified.to")), // EU: api-eu, AU: api-au
+		),
 		connectionID:    os.Getenv("UNIFIED_CONNECTION_ID"),
 		workspaceSecret: os.Getenv("UNIFIED_WORKSPACE_SECRET"),
 		publicURL:       strings.TrimRight(os.Getenv("PUBLIC_URL"), "/"),
 		port:            envOr("PORT", "3000"),
-		printJSON:       *printJSON,
 	}
 	if err := a.run(*name, meetingURL); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -138,90 +143,62 @@ func (a *app) run(name, meetingURL string) error {
 	logf("Listening for webhooks on http://localhost:%s%s", a.port, webhookPath)
 
 	// 2. Subscribe to bot events. One webhook carries events for every bot on the connection.
-	var webhook struct {
-		ID string `json:"id"`
-	}
-	err = a.unified("POST", "/unified/webhook", map[string]any{
-		"connection_id": a.connectionID,
-		"object_type":   "calendar_botevent",
-		"event":         "created",
-		"webhook_type":  "native",
-		"hook_url":      a.publicURL + webhookPath,
-	}, &webhook)
+	created, err := a.unified.Webhook.CreateUnifiedWebhook(ctx, operations.CreateUnifiedWebhookRequest{
+		Webhook: shared.Webhook{
+			ConnectionID: a.connectionID,
+			ObjectType:   shared.WebhookObjectTypeCalendarBotevent,
+			Event:        shared.WebhookEventCreated,
+			WebhookType:  shared.WebhookTypeNative.ToPointer(),
+			HookURL:      unified.String(a.publicURL + webhookPath),
+		},
+	})
 	if err != nil {
 		return err
 	}
-	logf("Webhook %s subscribed → %s%s", webhook.ID, a.publicURL, webhookPath)
+	webhookID := *created.Webhook.ID
+	logf("Webhook %s subscribed → %s%s", webhookID, a.publicURL, webhookPath)
 	defer func() {
-		logf("Removing webhook %s", webhook.ID)
-		if err := a.unified("DELETE", "/unified/webhook/"+webhook.ID, nil, nil); err != nil {
+		logf("Removing webhook %s", webhookID)
+		_, err := a.unified.Webhook.RemoveUnifiedWebhook(context.Background(), operations.RemoveUnifiedWebhookRequest{ID: webhookID})
+		if err != nil {
 			logf("%v", err)
 		}
 	}()
 
 	// 3. Send the bot into the meeting.
-	body := map[string]any{"name": name, "meeting_url": meetingURL}
+	bot := shared.CalendarBot{Name: unified.String(name), MeetingURL: unified.String(meetingURL)}
 	if strings.Contains(meetingURL, "zoom.us") {
-		// Zoom only: opt in to live captions and chat. Other platforms reject recording_config (501).
-		body["recording_config"] = map[string]any{"record_transcript": true, "record_chat": true}
+		// Zoom only: opt in to live captions and chat. Other platforms reject RecordingConfig (501).
+		bot.RecordingConfig = &shared.PropertyCalendarBotRecordingConfig{
+			RecordTranscript: unified.Bool(true),
+			RecordChat:       unified.Bool(true),
+		}
 	}
-	var bot struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
-	if err := a.unified("POST", "/calendar/"+a.connectionID+"/bot", body, &bot); err != nil {
+	res, err := a.unified.Calendar.CreateCalendarBot(ctx, operations.CreateCalendarBotRequest{
+		ConnectionID: a.connectionID,
+		CalendarBot:  bot,
+	})
+	if err != nil {
 		return err
 	}
-	a.botID.Store(bot.ID)
-	logf("Bot %s created (%s). Printing events; press Ctrl+C to stop.\n", bot.ID, bot.Status)
+	botID := *res.CalendarBot.ID
+	a.botID.Store(botID)
+	logf("Bot %s created (%s). Printing events; press Ctrl+C to stop.\n", botID, *res.CalendarBot.Status)
 
 	// 4. The webhook handler prints events until Ctrl+C.
 	<-ctx.Done()
 	stop() // a second Ctrl+C now quits immediately
 
 	// 5. Remove the bot. It leaves the meeting and stops sending events.
-	logf("\nRemoving bot %s", bot.ID)
-	if err := a.unified("DELETE", "/calendar/"+a.connectionID+"/bot/"+bot.ID, nil, nil); err != nil {
+	logf("\nRemoving bot %s", botID)
+	_, err = a.unified.Calendar.RemoveCalendarBot(context.Background(), operations.RemoveCalendarBotRequest{
+		ConnectionID: a.connectionID,
+		ID:           botID,
+	})
+	if err != nil {
 		logf("%v", err)
 	}
 	return nil // the deferred function removes the webhook
-}
-
-// --- Unified API -------------------------------------------------------------------
-
-// unified calls the Unified API, sending body as JSON and decoding the response into out.
-func (a *app) unified(method, path string, body, out any) error {
-	var reader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(b)
-	}
-	req, err := http.NewRequest(method, a.apiURL+path, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+a.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	text, err := io.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-	if res.StatusCode >= 300 {
-		return fmt.Errorf("%s %s → %d %s", method, path, res.StatusCode, text)
-	}
-	if out == nil || len(text) == 0 {
-		return nil
-	}
-	return json.Unmarshal(text, out)
 }
 
 // --- Webhook handling --------------------------------------------------------------
@@ -244,7 +221,7 @@ func (a *app) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Printing is fast, so we handle events before replying. Unified waits at most
-	// 5 seconds: hand slow work (summaries, CRM updates) to a queue or goroutine.
+	// 5 seconds, so slow work (like fetching the recording) runs in a goroutine.
 	for _, raw := range events {
 		a.handleEvent(raw)
 	}
@@ -278,23 +255,14 @@ func (a *app) handleEvent(raw json.RawMessage) {
 		return
 	}
 
-	// Deduplicate on id. Google Meet can reuse ids for status changes, so add changed_at.
-	if event.ID != "" {
-		key := event.ID
-		if event.StatusChange != nil {
-			key += ":" + event.StatusChange.ChangedAt
-		}
-		if _, repeat := a.seen.LoadOrStore(key, true); repeat {
-			return
-		}
-	}
-
-	if a.printJSON {
-		var line bytes.Buffer
-		json.Compact(&line, raw)
-		fmt.Println(line.String())
+	// Unified retries failed deliveries, so skip events we've already handled.
+	// Event ids alone can repeat, so compare whole events.
+	var key bytes.Buffer
+	json.Compact(&key, raw)
+	if _, repeat := a.seen.LoadOrStore(key.String(), true); repeat {
 		return
 	}
+
 	clock := "--:--:--"
 	if len(event.CreatedAt) >= 19 {
 		clock = event.CreatedAt[11:19] // HH:MM:SS (UTC)
@@ -304,6 +272,10 @@ func (a *app) handleEvent(raw json.RawMessage) {
 		kind = "UNKNOWN"
 	}
 	fmt.Println(strings.TrimRight(fmt.Sprintf("%s  %-27s  %s", clock, kind, describe(event)), " "))
+
+	if event.Type == "RECORDING_READY" {
+		go a.printRecording(event.BotID)
+	}
 }
 
 // describe returns one line of detail for each event type.
@@ -354,6 +326,57 @@ func nameOf(p *Participant) string {
 		return p.ID
 	}
 	return "unknown"
+}
+
+// --- Lesson 2: the recording and transcript ----------------------------------------
+
+// printRecording runs once RECORDING_READY fires: the bot now links to its recording.
+// It fetches the recording and prints the transcript.
+func (a *app) printRecording(botID string) {
+	const indent = "          "
+	ctx := context.Background()
+	res, err := a.unified.Calendar.GetCalendarBot(ctx, operations.GetCalendarBotRequest{ConnectionID: a.connectionID, ID: botID})
+	if err != nil {
+		logf("Could not fetch the recording: %v", err)
+		return
+	}
+	recordingID := res.CalendarBot.GetRecordingID()
+	if recordingID == nil {
+		fmt.Println(indent + "No recording_id on the bot yet")
+		return
+	}
+
+	rec, err := a.unified.Calendar.GetCalendarRecording(ctx, operations.GetCalendarRecordingRequest{
+		ConnectionID: a.connectionID,
+		ID:           *recordingID,
+	})
+	if err != nil {
+		logf("Could not fetch the recording: %v", err)
+		return
+	}
+	recording := rec.CalendarRecording
+	webURL := "(no web_url)"
+	if recording.WebURL != nil {
+		webURL = *recording.WebURL
+	}
+	// Build the whole block first, so concurrent prints can't split it.
+	var out strings.Builder
+	fmt.Fprintf(&out, "%sRecording %s: %s\n", indent, *recording.ID, webURL)
+	for _, media := range recording.Media {
+		for _, line := range media.Transcripts {
+			speaker := "unknown"
+			if line.Attendee != nil && line.Attendee.Name != nil {
+				speaker = *line.Attendee.Name
+			} else if line.Attendee != nil && line.Attendee.Email != nil {
+				speaker = *line.Attendee.Email
+			}
+			fmt.Fprintf(&out, "%s  %s: %s\n", indent, speaker, line.Text)
+		}
+		if len(media.Transcripts) == 0 && media.TranscriptDownloadURL != nil {
+			fmt.Fprintf(&out, "%s  Transcript file: %s\n", indent, *media.TranscriptDownloadURL)
+		}
+	}
+	fmt.Print(out.String())
 }
 
 // logf writes status messages to stderr, so stdout carries only events.

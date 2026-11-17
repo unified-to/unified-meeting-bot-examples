@@ -1,4 +1,4 @@
-# Runs all four examples against the mock Unified API on every push, using the
+# Runs all three examples against the mock Unified API on every push, using the
 # oldest Node.js, Python and Go versions the READMEs promise.
 name: test
 
@@ -8,7 +8,7 @@ on:
 
 jobs:
   examples:
-    runs-on: ubuntu-24.04 # setup-python has no Python 3.9 builds for Ubuntu 26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -16,25 +16,24 @@ jobs:
           node-version: "22"
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.9"
+          python-version: "3.10"
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.22"
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Install dependencies
+        run: |
+          (cd typescript && npm ci)
+          pip install -r python/requirements.txt
 
       - name: Check TypeScript
         working-directory: typescript
-        run: npm ci && npm run typecheck
+        run: npm run typecheck
 
       - name: Check Go
         working-directory: go
         run: test -z "$(gofmt -l .)" && go vet ./...
-
-      - name: Check Rust
-        working-directory: rust
-        run: cargo fmt --check && cargo clippy --release -- -D warnings
 
       - name: Run every example against the mock
         run: ./scripts/test-all.sh

@@ -3,19 +3,20 @@
 Unified meeting bot: Python example
 
 Sends a bot into a Zoom, Microsoft Teams, Webex or Google Meet meeting with
-Unified's Calendar API (calendar_bot), then prints every calendar_botevent
-webhook it receives.
+Unified's Calendar API (calendar_bot), prints every calendar_botevent webhook
+it receives, and fetches the recording and transcript when they're ready.
 
-    python3 meeting_bot.py [--name "Meeting Bot"] [--json] <meeting_url>
+    python3 meeting_bot.py [--name "Meeting Bot"] <meeting_url>
 
 How it works:
   1. Start a local HTTP server to receive webhooks (PUBLIC_URL forwards to it).
   2. Subscribe to calendar_botevent webhooks for the connection.
   3. Create the bot for the meeting URL.
-  4. Verify and print each event as it arrives.
+  4. Verify and print each event as it arrives. On RECORDING_READY, fetch the
+     recording and print its transcript.
   5. On Ctrl+C, remove the bot (it leaves the meeting) and the webhook.
 
-Standard library only: Python 3.9+.
+Uses the official SDK (pip install -r requirements.txt). Python 3.10+.
 """
 import argparse
 import base64
@@ -24,9 +25,10 @@ import hmac
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from unified_python_sdk import UnifiedTo
+from unified_python_sdk.models import shared
 
 WEBHOOK_PATH = "/bot-events"
 
@@ -34,16 +36,18 @@ WEBHOOK_PATH = "/bot-events"
 
 REQUIRED = ["UNIFIED_API_KEY", "UNIFIED_CONNECTION_ID", "UNIFIED_WORKSPACE_SECRET", "PUBLIC_URL"]
 
-API_URL = os.environ.get("UNIFIED_API_URL", "https://api.unified.to")
-API_KEY = os.environ.get("UNIFIED_API_KEY", "")
 CONNECTION_ID = os.environ.get("UNIFIED_CONNECTION_ID", "")
 WORKSPACE_SECRET = os.environ.get("UNIFIED_WORKSPACE_SECRET", "")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "3000"))
 
+unified = UnifiedTo(
+    security=shared.Security(jwt=os.environ.get("UNIFIED_API_KEY", "")),
+    server_url=os.environ.get("UNIFIED_API_URL", "https://api.unified.to"),  # EU: api-eu, AU: api-au
+)
+
 bot_id = None  # set once our bot exists
-print_json = False  # --json: print each event as raw JSON instead
-seen = set()  # Unified retries failed deliveries, so skip repeats
+seen = set()  # events already printed
 
 
 def log(message):
@@ -51,25 +55,9 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-# --- Unified API --------------------------------------------------------------------
-
-
-def unified(method, path, body=None):
-    request = urllib.request.Request(
-        API_URL + path,
-        method=method,
-        data=None if body is None else json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request) as response:
-            text = response.read().decode()
-    except urllib.error.HTTPError as err:
-        raise RuntimeError(f"{method} {path} → {err.code} {err.read().decode()}") from None
-    return json.loads(text) if text else {}
-
-
 # --- Webhook handling ---------------------------------------------------------------
+# Bot events arrive only as webhooks, so the SDK has no model for them: they're plain
+# dicts. Full model: https://docs.unified.to/calendar/botevent/model
 
 
 def is_signature_valid(delivery):
@@ -87,19 +75,22 @@ def handle_event(event):
     if bot_id and event.get("bot_id") != bot_id:
         return
 
-    # Deduplicate on id. Google Meet can reuse ids for status changes, so add changed_at.
-    if event.get("id"):
-        key = (event["id"], (event.get("status_change") or {}).get("changed_at"))
-        if key in seen:
-            return
-        seen.add(key)
-
-    if print_json:
-        print(json.dumps(event, separators=(",", ":"), ensure_ascii=False), flush=True)
+    # Unified retries failed deliveries, so skip events we've already handled.
+    # Event ids alone can repeat, so compare whole events.
+    key = json.dumps(event, sort_keys=True)
+    if key in seen:
         return
+    seen.add(key)
+
     time = (event.get("created_at") or "")[11:19] or "--:--:--"  # HH:MM:SS (UTC)
     kind = event.get("type") or "UNKNOWN"
     print(f"{time}  {kind:<27}  {describe(event)}".rstrip(), flush=True)
+
+    if kind == "RECORDING_READY":
+        try:
+            print_recording(event["bot_id"])
+        except Exception as err:
+            log(f"Could not fetch the recording: {err}")
 
 
 def describe(event):
@@ -125,6 +116,31 @@ def describe(event):
 def name_of(participant):
     p = participant or {}
     return p.get("name") or p.get("email") or p.get("id") or "unknown"
+
+
+# --- Lesson 2: the recording and transcript -----------------------------------------
+
+
+def print_recording(recording_bot_id):
+    """The bot links to its recording once RECORDING_READY fires. Fetch it and print the transcript."""
+    indent = " " * 10
+    bot = unified.calendar.get_calendar_bot(
+        request={"connection_id": CONNECTION_ID, "id": recording_bot_id}
+    ).calendar_bot
+    if not bot.recording_id:
+        print(f"{indent}No recording_id on the bot yet", flush=True)
+        return
+
+    recording = unified.calendar.get_calendar_recording(
+        request={"connection_id": CONNECTION_ID, "id": bot.recording_id}
+    ).calendar_recording
+    print(f"{indent}Recording {recording.id}: {recording.web_url or '(no web_url)'}", flush=True)
+    for media in recording.media or []:
+        for line in media.transcripts or []:
+            speaker = line.attendee and (line.attendee.name or line.attendee.email)
+            print(f"{indent}  {speaker or 'unknown'}: {line.text}", flush=True)
+        if not media.transcripts and media.transcript_download_url:
+            print(f"{indent}  Transcript file: {media.transcript_download_url}", flush=True)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -159,14 +175,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global bot_id, print_json
+    global bot_id
 
     parser = argparse.ArgumentParser(description="Join a meeting with a Unified bot and print its events.")
     parser.add_argument("meeting_url")
     parser.add_argument("--name", default="Meeting Bot", help="shown to people in the meeting")
-    parser.add_argument("--json", action="store_true", help="print each event as raw JSON")
     args = parser.parse_args()
-    print_json = args.json
 
     missing = [name for name in REQUIRED if not os.environ.get(name)]
     if missing:
@@ -179,24 +193,28 @@ def main():
     log(f"Listening for webhooks on http://localhost:{PORT}{WEBHOOK_PATH}")
 
     # 2. Subscribe to bot events. One webhook carries events for every bot on the connection.
-    webhook = unified("POST", "/unified/webhook", {
-        "connection_id": CONNECTION_ID,
-        "object_type": "calendar_botevent",
-        "event": "created",
-        "webhook_type": "native",
-        "hook_url": PUBLIC_URL + WEBHOOK_PATH,
-    })
-    log(f"Webhook {webhook['id']} subscribed → {PUBLIC_URL}{WEBHOOK_PATH}")
+    webhook = unified.webhook.create_unified_webhook(request={
+        "webhook": {
+            "connection_id": CONNECTION_ID,
+            "object_type": "calendar_botevent",
+            "event": "created",
+            "webhook_type": "native",
+            "hook_url": PUBLIC_URL + WEBHOOK_PATH,
+        },
+    }).webhook
+    log(f"Webhook {webhook.id} subscribed → {PUBLIC_URL}{WEBHOOK_PATH}")
 
     try:
         # 3. Send the bot into the meeting.
-        body = {"name": args.name, "meeting_url": args.meeting_url}
+        calendar_bot = {"name": args.name, "meeting_url": args.meeting_url}
         if "zoom.us" in args.meeting_url:
             # Zoom only: opt in to live captions and chat. Other platforms reject recording_config (501).
-            body["recording_config"] = {"record_transcript": True, "record_chat": True}
-        bot = unified("POST", f"/calendar/{CONNECTION_ID}/bot", body)
-        bot_id = bot["id"]
-        log(f"Bot {bot_id} created ({bot.get('status')}). Printing events; press Ctrl+C to stop.\n")
+            calendar_bot["recording_config"] = {"record_transcript": True, "record_chat": True}
+        bot = unified.calendar.create_calendar_bot(
+            request={"connection_id": CONNECTION_ID, "calendar_bot": calendar_bot}
+        ).calendar_bot
+        bot_id = bot.id
+        log(f"Bot {bot.id} created ({bot.status}). Printing events; press Ctrl+C to stop.\n")
 
         # 4. Handle webhooks until Ctrl+C.
         try:
@@ -205,16 +223,16 @@ def main():
             pass
 
         # 5. Remove the bot. It leaves the meeting and stops sending events.
-        log(f"\nRemoving bot {bot_id}")
+        log(f"\nRemoving bot {bot.id}")
         try:
-            unified("DELETE", f"/calendar/{CONNECTION_ID}/bot/{bot_id}")
-        except RuntimeError as err:
+            unified.calendar.remove_calendar_bot(request={"connection_id": CONNECTION_ID, "id": bot.id})
+        except Exception as err:
             log(str(err))
     finally:
-        log(f"Removing webhook {webhook['id']}")
+        log(f"Removing webhook {webhook.id}")
         try:
-            unified("DELETE", f"/unified/webhook/{webhook['id']}")
-        except RuntimeError as err:
+            unified.webhook.remove_unified_webhook(request={"id": webhook.id})
+        except Exception as err:
             log(str(err))
         server.server_close()
 
@@ -224,6 +242,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:  # Ctrl+C during setup
         sys.exit(130)
-    except (RuntimeError, OSError) as err:
+    except Exception as err:
         log(f"Error: {err}")
         sys.exit(1)

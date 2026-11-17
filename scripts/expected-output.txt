@@ -6,5 +6,9 @@
 15:00:13  CHAT_MESSAGE_RECEIVED        Sam Lee: Slides: https://example.com/deck?a=1&b=2
 15:00:17  PARTICIPANT_LEFT             Sam Lee
 15:00:19  BOT_STATUS_CHANGE            CALL_ENDED
-15:00:20  RECORDING_READY
-15:00:22  BOT_STATUS_CHANGE            DONE
+15:00:21  BOT_STATUS_CHANGE            DONE
+15:00:22  RECORDING_READY
+          Recording ID: https://zoom.us/rec/share/mock-recording
+            Jane Doe: Welcome, everyone. Let's start with the roadmap.
+            Sam Lee: Sounds good — Q&A at the end? <3 "café" ✓ 🎉
+            Jane Doe: Thanks, everyone.
